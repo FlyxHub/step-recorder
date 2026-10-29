@@ -9,7 +9,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 
 /// Vault-relative attachment folder from Obsidian's `attachmentFolderPath` setting.
 /// "" or "/" = vault root. "./x" means "x next to the note"; the note's folder isn't known
@@ -144,7 +144,8 @@ pub fn note_uri(vault: &Path, note: &str) -> String {
 /// Copies the screenshots into the vault and runs Claude Code there. Blocks until Claude
 /// finishes (minutes, typically). Returns the vault-relative path of the note it wrote, or ""
 /// if its reply doesn't name an existing file.
-/// On failure the copied screenshots are removed again; the recording folder is untouched.
+/// If it fails before Claude starts, the copied screenshots are removed again. The recording
+/// folder is never touched.
 pub fn send(dir: &Path, session: &Session, vault: &Path) -> Result<String, String> {
     // Timestamp only (not the title): short, and unique per recording.
     let session_name = session.started.dir_name();
@@ -153,28 +154,40 @@ pub fn send(dir: &Path, session: &Session, vault: &Path) -> Result<String, Strin
     fs::create_dir_all(&att).map_err(|e| format!("Can't create {}: {e}", att.display()))?;
     let att_rel = att.strip_prefix(vault).unwrap_or(Path::new("")).to_path_buf();
     let mut copied = Vec::new();
-    let result = (|| {
+    let started = (|| {
         let mut embeds = Vec::new();
         // steps.md as Claude sees it: same text, image links pointing at the copies in the vault.
         let mut in_vault = session.clone();
         for step in &mut in_vault.steps {
             let name = vault_image_name(&session_name, &step.image);
             let target = att.join(&name);
-            fs::copy(dir.join(&step.image), &target).map_err(|e| format!("Can't copy {}: {e}", step.image))?;
-            copied.push(target);
+            let err = |e: std::io::Error| format!("Can't copy {} to {}: {e}", step.image, target.display());
+            let mut src = fs::File::open(dir.join(&step.image)).map_err(err)?;
+            // create_new: a same-named file belongs to someone else (shared vault); never overwrite it.
+            let mut dst = fs::File::create_new(&target).map_err(err)?;
+            copied.push(target.clone());
+            std::io::copy(&mut src, &mut dst).map_err(err)?;
             step.image = att_rel.join(&name).to_string_lossy().replace('\\', "/");
             embeds.push(name);
         }
-        let note = run_claude(vault, &prompt(&session.title, &render::markdown(&in_vault), &rules, &embeds))?;
-        // A chatty reply isn't a path; "" makes the result window say it doesn't know the note.
-        Ok(if note_in_vault(vault, &note) { note } else { String::new() })
+        start_claude(vault, &prompt(&session.title, &render::markdown(&in_vault), &rules, &embeds))
     })();
-    if result.is_err() {
-        for f in &copied {
-            let _ = fs::remove_file(f);
+    // Until Claude starts, a failure removes the copies. After that the note may already embed
+    // them, so they stay.
+    let child = match started {
+        Ok(child) => child,
+        Err(e) => {
+            for f in &copied {
+                let _ = fs::remove_file(f);
+            }
+            return Err(e);
         }
-    }
-    result
+    };
+    let note = finish_claude(child).map_err(|e| {
+        format!("{e}\n\nThe screenshots were left in {} in case Claude already wrote part of the note.", att.display())
+    })?;
+    // A chatty reply isn't a path; "" makes the result window say it doesn't know the note.
+    Ok(if note_in_vault(vault, &note) { note } else { String::new() })
 }
 
 /// Arguments for the headless `claude` run.
@@ -208,7 +221,8 @@ fn claude_exe() -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
-fn run_claude(vault: &Path, prompt: &str) -> Result<String, String> {
+/// Starts Claude Code in the vault and hands it the prompt.
+fn start_claude(vault: &Path, prompt: &str) -> Result<Child, String> {
     let exe = claude_exe().ok_or("Couldn't find Claude Code. Install it and make sure `claude` is on PATH.")?;
     let mut cmd = Command::new(exe);
     cmd.args(claude_args())
@@ -223,12 +237,17 @@ fn run_claude(vault: &Path, prompt: &str) -> Result<String, String> {
     }
     let mut child = cmd.spawn().map_err(|e| format!("Couldn't start Claude Code: {e}"))?;
     // Prompt via stdin avoids command-line quoting and length limits.
-    child
-        .stdin
-        .take()
-        .ok_or("no stdin")?
-        .write_all(prompt.as_bytes())
-        .map_err(|e| format!("Couldn't pass the prompt to Claude Code: {e}"))?;
+    let written = child.stdin.take().ok_or(std::io::Error::other("no stdin")).and_then(|mut stdin| stdin.write_all(prompt.as_bytes()));
+    if let Err(e) = written {
+        // A cut-off prompt mustn't run.
+        let _ = child.kill();
+        return Err(format!("Couldn't pass the prompt to Claude Code: {e}"));
+    }
+    Ok(child)
+}
+
+/// Waits for Claude Code and returns the note path from its reply.
+fn finish_claude(child: Child) -> Result<String, String> {
     // ponytail: no timeout; a hung run leaves "Sending…" up until the app is closed.
     let out = child.wait_with_output().map_err(|e| format!("Claude Code didn't finish: {e}"))?;
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -334,6 +353,29 @@ mod tests {
         let err = r#"{"subtype":"error_max_turns","is_error":true,"result":""}"#;
         assert_eq!(parse_reply(err), Err("Claude Code reported an error: error_max_turns".into()));
         assert!(parse_reply("not json").unwrap_err().contains("Unexpected reply"));
+    }
+
+    #[test]
+    fn send_never_overwrites_a_vault_file() {
+        use crate::model::MouseButton;
+        use crate::model::tests::{raw, stamp};
+        let base = std::env::temp_dir().join(format!("step-recorder-send-{}", std::process::id()));
+        let (dir, vault) = (base.join("rec"), base.join("vault"));
+        fs::create_dir_all(dir.join("images")).unwrap();
+        fs::create_dir_all(&vault).unwrap();
+        fs::write(dir.join("images/step-001.png"), "ours").unwrap();
+        fs::write(dir.join("images/step-002.png"), "ours").unwrap();
+        let mut s = Session::new(stamp());
+        s.add_click(raw(MouseButton::Left, 0, 0), "W".into(), "a.exe".into(), "t".into(), 0);
+        s.add_click(raw(MouseButton::Left, 0, 0), "W".into(), "a.exe".into(), "t".into(), 10_000);
+        // Someone else's attachment with the same name (same second, shared vault).
+        let theirs = vault.join(vault_image_name(&s.started.dir_name(), "images/step-002.png"));
+        fs::write(&theirs, "theirs").unwrap();
+        assert!(send(&dir, &s, &vault).unwrap_err().contains("Can't copy"));
+        assert_eq!(fs::read_to_string(&theirs).unwrap(), "theirs");
+        // Claude never started, so our own copy of step 1 was cleaned up again.
+        assert!(!vault.join(vault_image_name(&s.started.dir_name(), "images/step-001.png")).exists());
+        fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]

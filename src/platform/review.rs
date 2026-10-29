@@ -208,6 +208,8 @@ fn selected_vault(r: &Review) -> Option<usize> {
     (i >= 0 && (i as usize) < r.settings.vaults.len()).then_some(i as usize)
 }
 
+/// Never call with `REVIEW` borrowed: an error notice runs a modal loop in which a click on
+/// this window would borrow it again and abort the app.
 fn save_settings(s: &Settings) {
     if let Err(e) = s.save(&settings_path()) {
         notice(&format!("Could not save settings: {e}"));
@@ -242,12 +244,13 @@ fn add_vault() {
         return;
     }
     let has_rules = folder.join("CLAUDE.md").is_file();
-    REVIEW.with_borrow_mut(|r| {
-        let Some(r) = r else { return };
+    let settings = REVIEW.with_borrow_mut(|r| {
+        let r = r.as_mut()?;
         let i = r.settings.add_vault(folder);
-        save_settings(&r.settings);
         fill_vaults(r, Some(i));
+        Some(r.settings.clone())
     });
+    settings.inspect(save_settings);
     if !has_rules {
         message(
             Some(hwnd()),
@@ -258,28 +261,28 @@ fn add_vault() {
 }
 
 fn remove_vault() {
-    REVIEW.with_borrow_mut(|r| {
-        let Some(r) = r else { return };
-        let Some(i) = selected_vault(r) else { return };
-        r.settings.remove_vault(i);
-        save_settings(&r.settings);
+    let settings = REVIEW.with_borrow_mut(|r| {
+        let r = r.as_mut()?;
+        r.settings.remove_vault(selected_vault(r)?);
         fill_vaults(r, r.settings.preferred());
+        Some(r.settings.clone())
     });
+    settings.inspect(save_settings);
 }
 
 /// Send to Obsidian: save, close, and run Claude Code in the chosen vault in the background.
 fn send_to_obsidian() {
-    let vault = REVIEW.with_borrow_mut(|r| {
+    let picked = REVIEW.with_borrow_mut(|r| {
         let r = r.as_mut()?;
         let vault = r.settings.vaults.get(selected_vault(r)?)?.clone();
         r.settings.last_vault = Some(vault.clone());
-        save_settings(&r.settings);
-        Some(vault)
+        Some((vault, r.settings.clone()))
     });
-    let Some(vault) = vault else {
+    let Some((vault, settings)) = picked else {
         message(Some(hwnd()), "Add an Obsidian vault with Add…, then pick it from the list.", MB_ICONINFORMATION);
         return;
     };
+    save_settings(&settings);
     let Some(r) = close(true) else { return }; // untitled: error shown, window stays
     let (dir, session) = (r.dir, r.session);
     let name = vault_name(&vault);
@@ -508,7 +511,7 @@ fn remove_current_step() {
     });
     match failed {
         None => println!("[review] step {n} removed"),
-        Some(e) => notice(&format!("Step {n} was removed, but its files weren't fully updated: {e}")),
+        Some(e) => notice(&format!("Step {n} couldn't be removed: {e}")),
     }
 }
 
