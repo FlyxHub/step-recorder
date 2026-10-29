@@ -9,7 +9,7 @@ use crate::worker::{Msg, QUEUED_CLICKS};
 use image::RgbaImage;
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 use std::sync::mpsc::Sender;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
@@ -35,8 +35,9 @@ pub const MAX_QUEUED_CLICKS: usize = 8;
 
 /// Id of the UI thread, so `notice` knows whether a modal box would block the worker.
 static UI_THREAD: AtomicU32 = AtomicU32::new(0);
-/// A Send to Obsidian run is in progress (set by the review window, cleared by `WM_APP_SENT`).
-pub(super) static SENDING: AtomicBool = AtomicBool::new(false);
+/// Send to Obsidian runs in progress (counted up by the review window, down by `WM_APP_SENT`).
+/// A count, so the first of two sends finishing doesn't drop the close guard for the second.
+pub(super) static SENDING: AtomicU32 = AtomicU32::new(0);
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum State {
@@ -298,8 +299,17 @@ pub struct Click {
 /// Opens a File Explorer window on `dir`. Doesn't wait for it.
 pub fn open_folder(dir: &Path) {
     use std::os::windows::process::CommandExt;
+    // Full path: a bare "explorer" would look in the recorder's own folder (often Downloads) first.
+    let mut buf = [0u16; 260];
+    let n = unsafe { windows::Win32::System::SystemInformation::GetSystemWindowsDirectoryW(Some(&mut buf)) };
+    // 0 = failed, > len = buffer too small; either way don't fall back to a search.
+    let Some(windir) = buf.get(..n as usize).filter(|w| !w.is_empty()) else {
+        eprintln!("[warn] could not find the Windows folder to open {}", dir.display());
+        return;
+    };
+    let explorer = Path::new(&String::from_utf16_lossy(windir)).join("explorer.exe");
     // Always quoted: unquoted, Explorer splits its command line on commas (a title may have one).
-    if let Err(e) = std::process::Command::new("explorer").raw_arg(format!("\"{}\"", dir.display())).spawn() {
+    if let Err(e) = std::process::Command::new(explorer).raw_arg(format!("\"{}\"", dir.display())).spawn() {
         eprintln!("[warn] could not open {}: {e}", dir.display());
     }
 }
@@ -579,9 +589,20 @@ fn toggle_pause() {
     }
 }
 
+/// Whether a `WM_COMMAND` is a click on our own button: lparam is that button's handle. Any
+/// process on the desktop can post `WM_COMMAND` with just an id (say, Send or Delete last step);
+/// this turns those away. One that also looks up the button's handle still gets through.
+pub(super) fn from_button(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> bool {
+    let (id, code) = ((wparam.0 & 0xffff) as i32, wparam.0 >> 16);
+    code == BN_CLICKED as usize
+        && lparam.0 != 0
+        && unsafe { GetDlgItem(Some(hwnd), id) }.is_ok_and(|b| b.0 as isize == lparam.0)
+}
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
-        WM_COMMAND => match wparam.0 & 0xffff {
+        // Enter and Esc (via IsDialogMessage) carry the Start / Pause button's handle too.
+        WM_COMMAND if from_button(hwnd, wparam, lparam) => match wparam.0 & 0xffff {
             ID_START => start(),
             ID_PAUSE => toggle_pause(),
             ID_STOP => stop(true),
@@ -612,7 +633,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         // Closing the app with a review open: it must be titled and saved like any other close.
         WM_CLOSE => {
             // The `claude` process would carry on without us; the result would just never show.
-            let still_sending = SENDING.load(Relaxed)
+            let still_sending = SENDING.load(Relaxed) > 0
                 && unsafe {
                     MessageBoxW(
                         Some(hwnd),
@@ -630,7 +651,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_APP_SENT => {
             // The message carries nothing (anyone can post it); a stray one finds an empty queue.
             for outcome in sent::take() {
-                SENDING.store(false, Relaxed);
+                SENDING.fetch_sub(1, Relaxed);
                 if STATE.get() == State::Idle {
                     set_state(State::Idle); // clear "Sending to Obsidian…"
                 }

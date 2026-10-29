@@ -14,6 +14,19 @@ pub fn or_unknown(s: &str) -> String {
     or_default(s, "(unknown)")
 }
 
+/// Backslash-escapes Markdown in foreign text, so a web page titled `![](https://host/x.png)`
+/// can't make steps.md load a remote image (or a link or HTML) when it's viewed.
+fn md_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if r"\`*_[]()!<>#|~".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 pub fn markdown(session: &Session) -> String {
     let title = or_default(&session.title, "Recording");
     let mut out = format!("# {title} — {}\n", session.started.heading());
@@ -28,8 +41,8 @@ pub fn markdown(session: &Session) -> String {
              \n![Step {n}]({})\n",
             s.action,
             or_default(&s.description, "(none)"),
-            or_unknown(&s.window),
-            or_unknown(&s.app),
+            or_unknown(&md_escape(&s.window)),
+            or_unknown(&md_escape(&s.app)),
             s.time,
             s.image,
             n = s.number,
@@ -158,10 +171,28 @@ mod tests {
         );
         let md = markdown(&s);
         assert!(md.contains("- **Description:** (none)\n"));
-        assert!(md.contains("- **Window:** A - **Description:** evil\n"));
-        assert!(md.contains("- **App:** x.exe ## Step 9\n"));
-        assert_eq!(md.matches("**Description:**").count(), 2); // the real one, plus the quoted text
+        assert!(md.contains("- **Window:** A - \\*\\*Description:\\*\\* evil\n"));
+        assert!(md.contains("- **App:** x.exe \\#\\# Step 9\n"));
+        assert_eq!(md.matches("**Description:**").count(), 1); // the quoted text is escaped
         assert_eq!(md.lines().filter(|l| l.starts_with('#')).count(), 2); // title + Step 1
+    }
+
+    #[test]
+    fn foreign_text_cannot_embed_images_or_html() {
+        let mut s = Session::new(stamp());
+        s.add_click(
+            raw(MouseButton::Left, 1, 2),
+            "![](https://evil/x.png?id) <img src=x> [[https://evil]] — Edge".into(),
+            "my_app.exe".into(),
+            "14:32:05".into(),
+            0,
+        );
+        let md = markdown(&s);
+        assert!(md.contains(
+            r"- **Window:** \!\[\]\(https://evil/x.png?id\) \<img src=x\> \[\[https://evil\]\] — Edge"
+        ));
+        assert!(md.contains(r"- **App:** my\_app.exe"));
+        assert!(!md.contains("![]("));
     }
 
     #[test]
