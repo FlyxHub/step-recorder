@@ -34,7 +34,9 @@ While recording, the same row holds Delete last step instead.
 - `start()` reads the box, sends it in `Msg::Start`, then clears it for the next recording.
 - The worker builds the folder with `Session::dir_name`: timestamp, plus the title passed
   through `folder_safe`, which removes `\/:*?"<>|`, collapses whitespace, caps it at 60
-  characters, and drops trailing dots and spaces.
+  characters, and drops trailing dots and spaces. `new_session_dir` never reuses a folder: if
+  the name exists (the clock repeated a second), it appends ` (2)`, ` (3)` … so Abort can't
+  delete an older recording.
 
 ## Release packaging
 - `cargo build --release` produces one self-contained exe. `.cargo/config.toml` sets
@@ -43,7 +45,9 @@ While recording, the same row holds Delete last step instead.
 - **Public builds:** panic messages embed source paths, including `C:\Users\<you>\.cargo\…`.
   Build with `cargo build --release --config "target.x86_64-pc-windows-msvc.rustflags=['--remap-path-prefix=$env:USERPROFILE=~']"`
   (PowerShell; `--config` arrays merge with `.cargo/config.toml`, so `+crt-static` stays). Then
-  check that the exe contains no username.
+  `Select-String -Path target\release\step-recorder.exe -SimpleMatch $env:USERPROFILE -Quiet`
+  must print False (it prints True for a plain build). It can't go in `.cargo/config.toml`
+  because that file has no env expansion.
 - `build.rs` (crate `winresource`) embeds `assets/icon.ico` as icon resource 1. The window class
   loads that icon too. It also sets FileDescription/ProductName "Step Recorder" (Task Manager
   shows FileDescription), and FileVersion/ProductVersion come from `Cargo.toml` `version`.
@@ -72,11 +76,14 @@ app, a warning appears (in the console, or in a dialog in release builds) and th
 handles it after any queued clicks, so "last" really is the newest step. The UI waits at most
 200 ms for the reply, because blocking the UI thread with the hook installed stalls the mouse
 and Windows silently removes the hook after `LowLevelHooksTimeout`. The status line then says
-which step was deleted (or "Last step deleted." if the reply was late). The removal goes through `worker::remove_step`, the same
-path as the review window's Remove step:
-1. `Session::remove` returns the delete plus the ordered `(old, new)` image renames.
-2. Apply them on disk.
-3. Rewrite md/json.
+which step was deleted, that there was none, or why it failed ("Deleting the last step…" if the
+reply was late). The removal goes through `worker::remove_step`, the same path as the review
+window's Remove step. It's all or nothing:
+1. `Session::remove` runs on a clone and returns the delete plus the ordered `(old, new)` image renames.
+2. The deleted image is renamed aside (`.removed`), then the renames are applied. If one fails
+   (a locked or missing file), the done renames are undone, the image is put back, and the
+   session is left unchanged, so `next_number` still matches the disk.
+3. The clone replaces the session, and md/json are rewritten.
 
 Removing the newest step also clears `last_click_ms`, so the next click can't double-click
 onto a step that's gone.
@@ -113,20 +120,28 @@ src/platform/sent.rs  result window after a send: Open in Obsidian / Close
 Threads:
 - **UI thread** runs the Win32 window, the message loop, `RegisterHotKey` (WM_HOTKEY), and the
   `WH_MOUSE_LL` hook. The hook is installed on Start and removed on Stop. Low-level hooks need
-  a message loop on the thread that installs them.
+  a message loop on the thread that installs them. While it's installed, a 1 s timer
+  (`hook_tick`) re-installs it, because Windows silently drops a hook that once overran
+  `LowLevelHooksTimeout` and nothing reports it. The same tick warns in the status line when
+  the foreground window is above our integrity level (see Platform quirks).
 - **Hook callback** runs on mouse-down and does three things:
   1. Skips the click if it lands on any window of our process, message boxes included
      (`WindowFromPoint` → `GA_ROOT` → pid == `GetCurrentProcessId`).
   2. `BitBlt`s that monitor into an `HBITMAP` (a GPU→memory copy, a few ms). Each queued
      click holds one of these (~33 MB at 4K), so with `MAX_QUEUED_CLICKS` (8) still unprocessed
-     (`worker::QUEUED_CLICKS`) the click is skipped and the status line says so.
+     (`worker::QUEUED_CLICKS`) the click is skipped and the status line says so. The status line
+     also reports a failed capture (e.g. `CreateCompatibleBitmap` returning null when GDI memory
+     runs out).
   3. Reads the title and pid, then sends `Msg::Click` over `mpsc`.
 
   The capture runs here deliberately: it's the only way to get the screen *before* the target
   app reacts to the click.
 - **Worker** does all the slow work: `GetDIBits` → RGBA, draws the cursor arrow, PNG-encodes the image,
   resolves the process name, and writes the files. It rewrites `steps.md` / `steps.json` after
-  every step so a crash loses nothing.
+  every step so a crash loses nothing. Each is written to `<name>.tmp`, flushed, and renamed
+  over the old one (`write_whole`), so a crash mid-write never leaves a truncated file. If the
+  rename is blocked (a viewer holding the file without delete sharing), it falls back to a plain
+  write.
 
 The `Platform` trait for faking the desktop in tests is deferred to Phase 2. The keystroke
 coalescer will be its first consumer. Phase 1 pure logic takes plain data.
@@ -147,7 +162,9 @@ coalescer will be its first consumer. Phase 1 pure logic takes plain data.
 - `SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2)` must run before any window is created.
   With it set, the LL hook's `pt`, `rcMonitor` and `BitBlt` are all in physical pixels.
   Image coordinates are `pt - rcMonitor.topleft`, which also works for monitors at negative
-  offsets. The scale factor is `GetDpiForMonitor(MDT_EFFECTIVE_DPI) / 96`.
+  offsets. The scale factor is `GetDpiForMonitor(MDT_EFFECTIVE_DPI) / 96`. Its error is ignored:
+  it fails when awareness was already set (the exe's Compatibility-tab DPI override), and the
+  coordinates still agree with each other then.
 - `EnumDisplayMonitors` order (= `monitor_index`) is not "primary first". On the dev machine the
   primary monitor was index 1.
 - The control window is sized for the system DPI at startup. It doesn't handle `WM_DPICHANGED`,
@@ -158,8 +175,11 @@ coalescer will be its first consumer. Phase 1 pure logic takes plain data.
   (Windows 10 2004+). DWM honors it for GDI `BitBlt`. It only works on windows our process owns, so
   the console window (owned by conhost or Windows Terminal) still shows up in screenshots.
 - `BitBlt` uses `CAPTUREBLT` so that layered windows (menus, tooltips) appear in the shot.
-- Untested so far: clicks on elevated (admin) windows while the recorder runs unelevated. UIPI
-  may hide them from the hook.
+- UIPI keeps clicks on elevated (admin) windows from an unelevated recorder's hook. Instead of
+  losing them silently, `hook_tick` checks the foreground process's integrity level
+  (`foreground_is_elevated`; an unreadable token counts as higher) and the status line says
+  "Admin window: its clicks can't be recorded." Running the recorder as administrator records
+  them. Not tested yet against a real elevated window.
 
 ## Output format
 - The heading is `# <title> — YYYY-MM-DD HH:MM`, or `# Recording — …` when no title was given.
@@ -221,7 +241,8 @@ coalescer will be its first consumer. Phase 1 pure logic takes plain data.
     `review::finish` saves it first.
 - **Forged clicks:** any process on the desktop can post `WM_COMMAND`. The control and review
   wndprocs act on a button id only when lparam is that button's own HWND (`win::from_button`).
-  Real clicks, `BM_CLICK`, and IsDialogMessage's Enter/Esc all carry it. The exception is the
+  Real clicks, `BM_CLICK`, and IsDialogMessage's Enter (IDOK = `ID_START` in the control window)
+  all carry it. `ID_PAUSE` is 6, not 2: as IDCANCEL, Esc would toggle Pause. The exception is the
   review's IDOK (Enter, lparam 0), which only means Next. A process that looks up the button
   handle, or posts `WM_HOTKEY` / `WM_ENDSESSION`, still gets through. `WM_ENDSESSION` is left
   unchecked on purpose: a wrong guess would lose typed descriptions at logoff.
@@ -230,7 +251,10 @@ coalescer will be its first consumer. Phase 1 pure logic takes plain data.
 - **RefCell re-entrancy:** `REVIEW` is borrowed only for button clicks (`WM_COMMAND` with
   notification code 0), paint (`try_borrow`) and close. `show()` sets the edit text while
   borrowed, and the edit box sends `EN_CHANGE` back synchronously, so those notifications must
-  never borrow. `finish()` takes the state out before `DestroyWindow`.
+  never borrow. `finish()` takes the state out before `DestroyWindow`. Never call `notice` or
+  `save_settings` while borrowed either: in release, `notice` runs a modal box owned by the
+  control window, the review stays clickable behind it, and a click would borrow again and
+  abort the app. The vault handlers clone the settings out and save after the borrow.
 - **Preview:** the PNG is decoded from disk and painted with `StretchDIBits` (HALFTONE) into a
   box fitted by `render::fit`.
 - **Placement and capture:** the window opens centred on the monitor under the cursor, because
@@ -280,8 +304,11 @@ coalescer will be its first consumer. Phase 1 pure logic takes plain data.
      message box on error.
   7. Open uses `ShellExecuteW` on `obsidian://open?vault=…&file=…`. Never use `explorer.exe`
      for it: explorer mangles links containing `&` and opens File Explorer instead.
-- **Failure:** the copied screenshots are deleted again, and the local recording is untouched.
-  There's no timeout yet (ponytail note in `run_claude`).
+- **Failure:** before Claude starts (`start_claude`), the copied screenshots are deleted again.
+  Once it has run, they stay, because the note may already embed them, and the error says
+  where they are. Copies use `File::create_new`, so a same-named file in a shared vault is
+  never overwritten (the send fails instead). The local recording is never touched. There's
+  no timeout yet (ponytail note in `finish_claude`).
 - **Closing the app while sending** (`win::SENDING`, a count of running sends) asks first: the
   `claude` process isn't killed and keeps writing the note, but nobody is left to show the result.
 - **Tools are an allowlist on purpose.** `--tools` gives Claude only Read, Glob, Grep, Write

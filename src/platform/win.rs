@@ -21,11 +21,13 @@ use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::*;
 
-const ID_START: usize = 1;
-const ID_PAUSE: usize = 2;
+const ID_START: usize = 1; // = IDOK, so Enter in the Title box starts recording
+const ID_PAUSE: usize = 6; // not 2 (IDCANCEL), or Esc would toggle Pause
 const ID_STOP: usize = 3;
 const ID_ABORT: usize = 4;
 const ID_DELETE_LAST: usize = 5;
+/// While the hook is installed: re-arms it and checks for elevated windows, every second.
+const TIMER_HOOK: usize = 1;
 const HK_RECORD: i32 = 1;
 const HK_PAUSE: i32 = 2;
 const CLASS: PCWSTR = w!("StepRecorderWindow");
@@ -56,6 +58,8 @@ thread_local! {
     static TITLE_LABEL: Cell<HWND> = const { Cell::new(HWND(std::ptr::null_mut())) };
     static TITLE: Cell<HWND> = const { Cell::new(HWND(std::ptr::null_mut())) };
     static HOOK: Cell<Option<HHOOK>> = const { Cell::new(None) };
+    /// The status line is showing the "admin window" warning.
+    static ELEVATED: Cell<bool> = const { Cell::new(false) };
     static TX: RefCell<Option<Sender<Msg>>> = const { RefCell::new(None) };
     /// Status band backgrounds: (recording, paused).
     static BRUSHES: Cell<(HBRUSH, HBRUSH)> =
@@ -215,6 +219,12 @@ impl Shot {
             let screen = GetDC(None);
             let mem = CreateCompatibleDC(Some(screen));
             let bmp = CreateCompatibleBitmap(screen, w, h);
+            // Null when GDI memory runs out. BitBlt would then "succeed" into the DC's 1x1 bitmap.
+            if bmp.is_invalid() {
+                let _ = DeleteDC(mem);
+                ReleaseDC(None, screen);
+                return None;
+            }
             let old = SelectObject(mem, bmp.into());
             // CAPTUREBLT includes layered windows (menus, tooltips).
             let ok = BitBlt(mem, 0, 0, w, h, Some(screen), r.left, r.top, SRCCOPY | CAPTUREBLT);
@@ -387,6 +397,7 @@ fn on_click(button: MouseButton, pt: POINT, ms: u32) {
         let r = mi.rcMonitor;
         let Some(shot) = Shot::grab(r) else {
             eprintln!("[error] screen capture failed");
+            set_status("● RECORDING. Screen capture failed: a click was skipped.");
             return;
         };
         let (mut dpi, mut _dpi_y) = (96u32, 96u32);
@@ -432,11 +443,76 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
     unsafe { CallNextHookEx(None, code, wparam, lparam) }
 }
 
+fn install_hook() -> Result<HHOOK> {
+    unsafe {
+        let hinst = GetModuleHandleW(None).ok().map(HINSTANCE::from);
+        SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), hinst, 0)
+    }
+}
+
+/// Mandatory integrity level (RID) of a process, or None if its token can't be read.
+fn integrity(process: HANDLE) -> Option<u32> {
+    use windows::Win32::Security::*;
+    unsafe {
+        let mut token = HANDLE::default();
+        OpenProcessToken(process, TOKEN_QUERY, &mut token).ok()?;
+        let mut buf = [0u64; 8]; // TOKEN_MANDATORY_LABEL plus a one-part SID; u64 for alignment
+        let mut len = 0;
+        let ok = GetTokenInformation(token, TokenIntegrityLevel, Some(buf.as_mut_ptr().cast()), 64, &mut len);
+        let _ = CloseHandle(token);
+        ok.ok()?;
+        let sid = (*buf.as_ptr().cast::<TOKEN_MANDATORY_LABEL>()).Label.Sid;
+        let last = (*GetSidSubAuthorityCount(sid)).checked_sub(1)?;
+        Some(*GetSidSubAuthority(sid, last as u32))
+    }
+}
+
+/// Whether the foreground window belongs to a process above our integrity level (an admin app,
+/// when we aren't elevated). UIPI keeps its clicks from our hook, so they'd silently go missing.
+fn foreground_is_elevated() -> bool {
+    unsafe {
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(GetForegroundWindow(), Some(&mut pid));
+        if pid == 0 {
+            return false; // nothing in front (mid-switch)
+        }
+        // A process or token we can't read is an elevated or system one, as far as we can tell.
+        let Ok(h) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else { return true };
+        let theirs = integrity(h);
+        let _ = CloseHandle(h);
+        theirs.is_none_or(|t| integrity(GetCurrentProcess()).is_some_and(|ours| t > ours))
+    }
+}
+
+/// Every second while the hook is installed.
+fn hook_tick() {
+    // Windows silently drops a hook that once overran LowLevelHooksTimeout (a hung window under
+    // the cursor, a slow capture). Re-arming costs nothing and caps the loss at a second.
+    // New hook first: no gap, and no hook call can run between the two (it needs our message loop).
+    if let Some(old) = HOOK.get()
+        && let Ok(new) = install_hook()
+    {
+        HOOK.set(Some(new));
+        let _ = unsafe { UnhookWindowsHookEx(old) };
+    }
+    if STATE.get() == State::Recording {
+        let elevated = foreground_is_elevated();
+        if elevated != ELEVATED.get() {
+            set_state(State::Recording); // resets the status line and ELEVATED
+            if elevated {
+                ELEVATED.set(true);
+                set_status("● RECORDING. Admin window: its clicks can't be recorded.");
+            }
+        }
+    }
+}
+
 fn set_state(new: State) {
     let old = STATE.replace(new);
     if old != new {
         println!("[state] {old:?} -> {new:?}");
     }
+    ELEVATED.set(false); // the status line is reset below; the next tick re-checks
     let (title, status) = match new {
         State::Idle => ("Step Recorder", "Idle. Ctrl+Alt+R to record."),
         State::Recording => ("● REC - Step Recorder", "● RECORDING. Ctrl+Alt+P pause, Ctrl+Alt+R stop."),
@@ -491,9 +567,11 @@ fn delete_last() {
     // Windows silently removes the hook (LowLevelHooksTimeout).
     send(Msg::DeleteLast { reply: tx });
     match rx.recv_timeout(std::time::Duration::from_millis(200)) {
-        Ok(Some(n)) => set_status(&format!("{label} Step {n} deleted.")),
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => set_status(&format!("{label} Last step deleted.")),
-        _ => set_status(&format!("{label} No steps to delete.")),
+        Ok(Ok(Some(n))) => set_status(&format!("{label} Step {n} deleted.")),
+        Ok(Ok(None)) => set_status(&format!("{label} No steps to delete.")),
+        Ok(Err(e)) => set_status(&format!("{label} Couldn't delete the last step: {e}")),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => set_status(&format!("{label} Deleting the last step…")),
+        Err(_) => {}
     }
 }
 
@@ -509,15 +587,12 @@ fn start() {
     }
     let stamp = now();
     let title = control_text(TITLE.get());
-    let hook = unsafe {
-        let hinst = GetModuleHandleW(None).ok().map(HINSTANCE::from);
-        SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), hinst, 0)
-    };
-    let hook = match hook {
+    let hook = match install_hook() {
         Ok(h) => h,
         Err(e) => return notice(&format!("Recording could not start: mouse hook failed ({e})")),
     };
     HOOK.set(Some(hook));
+    unsafe { SetTimer(Some(MAIN.get()), TIMER_HOOK, 1000, None) };
     send(Msg::Start { root: recordings_root(), started: stamp, title: title.clone() });
     unsafe {
         let _ = SetWindowTextW(TITLE.get(), w!("")); // fresh box for the next recording
@@ -536,9 +611,7 @@ fn stop(review: bool) {
     if STATE.get() == State::Idle {
         return;
     }
-    if let Some(h) = HOOK.take() {
-        let _ = unsafe { UnhookWindowsHookEx(h) };
-    }
+    unhook();
     set_state(State::Idle);
     if !review {
         return send(Msg::Stop { review: None });
@@ -549,6 +622,15 @@ fn stop(review: bool) {
     // under a second). Hand back via PostMessage if that ever becomes noticeable.
     if let Ok((dir, session)) = rx.recv() {
         review::open(dir, session);
+    }
+}
+
+fn unhook() {
+    unsafe {
+        let _ = KillTimer(Some(MAIN.get()), TIMER_HOOK);
+        if let Some(h) = HOOK.take() {
+            let _ = UnhookWindowsHookEx(h);
+        }
     }
 }
 
@@ -574,9 +656,7 @@ fn abort() {
     if answer != IDYES {
         return set_state(before);
     }
-    if let Some(h) = HOOK.take() {
-        let _ = unsafe { UnhookWindowsHookEx(h) };
-    }
+    unhook();
     send(Msg::Abort);
     set_state(State::Idle);
 }
@@ -610,6 +690,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             ID_DELETE_LAST => delete_last(),
             _ => {}
         },
+        WM_TIMER if wparam.0 == TIMER_HOOK => hook_tick(),
         WM_HOTKEY => match wparam.0 as i32 {
             HK_RECORD if STATE.get() == State::Idle => start(),
             HK_RECORD => stop(true),
@@ -678,7 +759,9 @@ pub fn run(tx: Sender<Msg>) -> Result<()> {
         UI_THREAD.store(GetCurrentThreadId(), Relaxed);
         // Must come before any window exists. Makes hook points, monitor rects and BitBlt
         // all use physical pixels, so scaled and secondary monitors line up.
-        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)?;
+        // Fails if awareness was already set, e.g. by the exe's Compatibility-tab DPI override.
+        // That's fine: hook points, monitor rects and BitBlt still agree with each other.
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         // The vault folder picker (IFileOpenDialog) is a COM object.
         let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
         let hinst: HINSTANCE = GetModuleHandleW(None)?.into();
@@ -751,4 +834,16 @@ pub fn run(tx: Sender<Msg>) -> Result<()> {
     }
     TX.take(); // drop the sender so the worker drains and exits
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_own_integrity_level() {
+        // Medium (0x2000) unelevated, high (0x3000) when run as administrator.
+        let own = integrity(unsafe { GetCurrentProcess() });
+        assert!(matches!(own, Some(0x2000 | 0x3000)), "{own:?}");
+    }
 }

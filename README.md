@@ -77,8 +77,15 @@ path so it isn't embedded in the exe (PowerShell):
 cargo build --release --config "target.x86_64-pc-windows-msvc.rustflags=['--remap-path-prefix=$env:USERPROFILE=~']"
 ```
 
+Before uploading, check that it worked. This must print `False`:
+
+```
+Select-String -Path target\release\step-recorder.exe -SimpleMatch $env:USERPROFILE -Quiet
+```
+
 ## Limitations
 
 - Records mouse clicks only; keystrokes aren't captured yet.
 - Password fields aren't redacted yet, so pause first.
-- Clicks on apps running as administrator may not be recorded when Step Recorder isn't elevated.
+- Clicks on apps running as administrator aren't recorded unless Step Recorder runs as
+  administrator too. The status line warns while such a window is in front.
