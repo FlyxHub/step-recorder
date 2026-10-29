@@ -11,7 +11,7 @@
 
 use super::sent::{self, Outcome};
 use super::win::{
-    SENDING, WM_APP_SENT, centered, child, control_text, main_hwnd, notice, open_folder, px, register_class,
+    SENDING, WM_APP_SENT, centered, child, control_text, from_button, main_hwnd, notice, open_folder, px, register_class,
     settings_path, show_activity,
 };
 use crate::model::Session;
@@ -286,7 +286,7 @@ fn send_to_obsidian() {
     show_activity(&format!("Sending to {name}… a window opens when done."));
     println!("[obsidian] sending {} to {}", dir.display(), vault.display());
     let main = main_hwnd().0 as isize; // HWND isn't Send; the raw handle is fine to post to
-    SENDING.store(true, Relaxed); // closing the app now asks first
+    SENDING.fetch_add(1, Relaxed); // closing the app now asks first
     std::thread::spawn(move || {
         let result = obsidian::send(&dir, &session, &vault);
         // The UI thread drains the queue (sent::take) and shows the result. If the post fails the
@@ -533,9 +533,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_COMMAND if id == ID_TITLE && code == EN_CHANGE => unsafe {
             let _ = ShowWindow(TITLE_ERROR.get(), SW_HIDE);
         },
-        // Only button clicks (notification code 0). Edit-box notifications arrive while `show`
-        // is updating controls with REVIEW borrowed, so they must not touch it.
-        WM_COMMAND if code == 0 => match id {
+        // Only button clicks. Edit-box notifications arrive while `show` is updating controls
+        // with REVIEW borrowed, so they must not touch it. IDOK (Enter, via IsDialogMessage) has
+        // no button, so its lparam is 0; a forged one only means Next.
+        WM_COMMAND if code == 0 && (id == 1 || from_button(hwnd, wparam, lparam)) => match id {
             ID_BACK => go(-1),
             // IDOK is Enter in a text box (via IsDialogMessage in the main loop).
             ID_NEXT | 1 => go(1),

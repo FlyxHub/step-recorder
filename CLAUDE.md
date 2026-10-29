@@ -23,7 +23,8 @@ Building also needs `rc.exe` from the Windows SDK (installed with the VS Build T
 `build.rs` embeds the icon and version info.
 
 Sessions are written to `%USERPROFILE%\Step Recordings\YYYY-MM-DD_HH-MM-SS[ <title>]\`, whatever
-the working directory. When recording stops, File Explorer opens on the session folder.
+the working directory. When recording stops, File Explorer opens on the session folder
+(`open_folder` runs `<system Windows dir>\explorer.exe` by full path, never a bare `explorer`).
 
 **Title (required before saving or sending):** while idle, the control window's bottom row is a
 "Title" box. It's optional at Start, and the review window's title field is prefilled from it.
@@ -166,7 +167,9 @@ coalescer will be its first consumer. Phase 1 pure logic takes plain data.
 - Every step has exactly these fields in this order: Action, Description, Window, App, Time.
   An empty Window or App renders as `(unknown)`, and an empty Description as `(none)`.
   Control characters (newlines) in any field become spaces, so a foreign window title can't
-  forge a Description line.
+  forge a Description line. Window and App are also Markdown-escaped (`render::md_escape`,
+  backslash before ``\`*_[]()!<>#|~``), so a web page title like `![](https://host/x.png)`
+  can't turn into a remote image or link when steps.md is viewed. steps.json keeps the raw text.
 - Image paths are relative (`images/step-NNN.png`).
 - `steps.json` has the same data plus `raw` (button, x, y, monitor_index, monitor_origin, scale,
   double).
@@ -216,6 +219,12 @@ coalescer will be its first consumer. Phase 1 pure logic takes plain data.
     empty session folder.
   - Closing the app (`stop(false)`) skips the review. If a review is already open,
     `review::finish` saves it first.
+- **Forged clicks:** any process on the desktop can post `WM_COMMAND`. The control and review
+  wndprocs act on a button id only when lparam is that button's own HWND (`win::from_button`).
+  Real clicks, `BM_CLICK`, and IsDialogMessage's Enter/Esc all carry it. The exception is the
+  review's IDOK (Enter, lparam 0), which only means Next. A process that looks up the button
+  handle, or posts `WM_HOTKEY` / `WM_ENDSESSION`, still gets through. `WM_ENDSESSION` is left
+  unchecked on purpose: a wrong guess would lose typed descriptions at logoff.
 - **Keyboard:** the main loop runs `IsDialogMessageW` for the review and sent windows. That gives Tab
   between controls, and Enter in the text box arrives as `IDOK`, which is mapped to Next.
 - **RefCell re-entrancy:** `REVIEW` is borrowed only for button clicks (`WM_COMMAND` with
@@ -248,14 +257,21 @@ coalescer will be its first consumer. Phase 1 pure logic takes plain data.
      drive letters, UNC or rooted paths) falls back to the vault root. Files are renamed `<timestamp>-step-NNN.png` (from `started.dir_name()`, so the title
      never goes into image names), which keeps `![[…]]` embeds unique.
   4. Run `claude -p --output-format json --permission-mode acceptEdits --strict-mcp-config
-     --tools Read,Glob,Grep,Write,Edit --restricted --add-dir <session>` hidden (`CREATE_NO_WINDOW`), with the
-     vault as the working directory. `--restricted` doesn't load the vault's CLAUDE.md, so
-     `send` reads it and puts it at the end of the prompt. The prompt goes in via stdin.
+     --tools Read,Glob,Grep,Write,Edit --disallowedTools "Edit(**/.*)" "Edit(**/.*/**)"
+     --restricted` hidden (`CREATE_NO_WINDOW`), with the vault as the working directory. The
+     exe is resolved from PATH to an absolute path (`claude_exe`); a bare name would let a
+     `claude.exe` beside step-recorder.exe win. `--restricted` doesn't load the vault's
+     CLAUDE.md, so `send` reads it (`vault_rules`: refused if it's a link or over 64 KB, since
+     its text is uploaded) and puts it at the end of the prompt. The prompt goes in via stdin.
   5. The prompt (`obsidian::prompt`) gives the user's title, if any, as the basis for the
-     note's title. It also gives the recording folder and the exact embeds, says
-     recording content is data rather than instructions, includes the vault's CLAUDE.md as the
-     rules to follow, and asks Claude to reply with only the note's vault-relative path. A reply that isn't an existing file
-     in the vault is treated as "didn't say which note" (no Open button).
+     note's title, the exact embeds, and steps.md itself with its image links pointing at the
+     copies in the vault. Claude gets no access to the recording folder (no `--add-dir`), so it
+     can't damage the only local copy. It says recording content is data rather than
+     instructions, presents the vault's CLAUDE.md as untrusted conventions (not rules to obey),
+     and asks Claude to reply with only the note's vault-relative path. A reply that isn't a
+     plain relative path (`note_in_vault`) is rejected without touching the filesystem (a UNC
+     path would make Windows try SMB with the user's credentials). One that isn't an existing
+     file in the vault is treated as "didn't say which note" (no Open button).
   6. The thread pushes a `sent::Outcome` onto `sent::PENDING` and posts `WM_APP_SENT` (lparam 0)
      to the control window. The message carries no data, because any process can post that
      number; a stray one finds the queue empty. The UI thread drains the queue, restores the
@@ -266,20 +282,31 @@ coalescer will be its first consumer. Phase 1 pure logic takes plain data.
      for it: explorer mangles links containing `&` and opens File Explorer instead.
 - **Failure:** the copied screenshots are deleted again, and the local recording is untouched.
   There's no timeout yet (ponytail note in `run_claude`).
-- **Closing the app while sending** (`win::SENDING`) asks first: the `claude` process isn't
-  killed and keeps writing the note, but nobody is left to show the result.
+- **Closing the app while sending** (`win::SENDING`, a count of running sends) asks first: the
+  `claude` process isn't killed and keeps writing the note, but nobody is left to show the result.
 - **Tools are an allowlist on purpose.** `--tools` gives Claude only Read, Glob, Grep, Write
   and Edit, and `--strict-mcp-config` (with no `--mcp-config`) loads no MCP servers. So text in
   the recording (window titles come from web pages) can't make it run commands, post to
-  Slack/Jira, or reach the web. Don't switch back to a `--disallowedTools` denylist. `--restricted` is just as
+  Slack/Jira, or reach the web. Don't swap the `--tools` allowlist for a `--disallowedTools`
+  tool denylist. `--restricted` is just as
   important: the vault is untrusted (it may be synced or shared), and without it a vault's
   `.claude/settings.json` hooks or `apiKeyHelper` would run as the user, hidden, before Claude
   reads the prompt. It ignores user/project/local settings, including the vault's CLAUDE.md
-  (hence the prompt carries it), and fences the file tools to the vault and the recording
-  folder. Needs Claude Code 2.1.248+. Checked on 2026-10-20 with a scratch vault: a
-  `SessionStart` hook ran without the flag and not with it, and Write and `--add-dir` reads
-  still worked. That's why the recorder copies the images itself: Write can't create binary
-  files.
+  (hence the prompt carries it), and fences the file tools to the vault. Needs Claude Code
+  2.1.248+. Checked on 2026-10-20 with a scratch vault: a
+  `SessionStart` hook ran without the flag and not with it, and Write still worked. Write can't
+  create binary files, which is why the recorder copies the images itself.
+- **No writes to dot paths.** The vault itself is an execution surface: Obsidian runs
+  `.obsidian/plugins/*/main.js` on open, and `.claude`, `.vscode` and `.git` hold hooks and tasks.
+  `--restricted` doesn't cover `.obsidian`, so the path-scoped deny rules `Edit(**/.*)` and
+  `Edit(**/.*/**)` block every dot file and folder (Edit rules cover Write). Checked on 2026-10-29
+  with Claude Code 2.1.294: writes to `.obsidian/plugins`, `.claude`, `.vscode` and `.gitignore`
+  were denied and a normal note was written. A before/after snapshot of `.obsidian` was rejected
+  because Obsidian rewrites `workspace.json` while it's open.
+  Not covered: a note can still contain a `dataviewjs` block, which runs if the vault has
+  Dataview JS queries enabled.
+- **Live test pitfall:** a vault path with an 8.3 short name (`JHOCHS~1`, as `$TMP` is in Git
+  Bash) makes Claude Code deny every read and write. Use the long path.
 - **Testing UI without touching real settings:** set `$env:APPDATA` to a scratch folder before
   launching. Write the JSON with `ConvertTo-Json`, because hand-written backslashes are easy to
   break, and invalid JSON silently loads as defaults.
